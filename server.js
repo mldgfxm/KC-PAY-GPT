@@ -22,6 +22,27 @@ const browserPool = require('./browser-pool');
 const { buildWorkerRuntimeEnv } = require('./browser-runtime');
 const { querySubscriptionBySession, validateSessionTokenForQuery, cancelAutoRenew, resumeAutoRenew } = require('./subscription-check');
 const gptApi = require('./gpt-api-client');
+const { getHardeningService } = require('./hardening/factory');
+const { createController: createHardeningController } = require('./hardening/controller');
+const hardening = getHardeningService();
+const hardeningController = createHardeningController(hardening);
+const { createActivationService } = require('./hardening/activation-service');
+const { createActivationController } = require('./hardening/controller');
+const { createLegacyManager } = require('./hardening/legacy-manager');
+const sessions = require('./session-auth');
+const closeAutoRenewAfterRecharge = input => hardening.closeAfterRecharge(input);
+const activationService = createActivationService({
+    manager: createLegacyManager(store), safety: hardening,
+    sessions: { ...sessions, validateAccessToken },
+    runtime: {
+        reserve: reserveForegroundSlot, release: releaseForegroundSlot,
+        launchLocal: spawnActivationWorker,
+        launchThirdParty: args => runGptApiWorker(args).catch(() => console.error('[代充] 任务执行器异常'))
+    },
+    notify: fireTelegramNotification
+});
+const activationController = createActivationController(activationService, getClientIp);
+const cardImportService = require('./hardening/card-import-factory');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -66,8 +87,9 @@ function reserveForegroundSlot(slotKey) {
     activeForegroundJobs.add(String(slotKey));
 }
 
-function releaseForegroundSlot(slotKey) {
+async function releaseForegroundSlot(slotKey) {
     activeForegroundJobs.delete(String(slotKey));
+    await hardening.release(String(slotKey)).catch(() => {});
 }
 
 function getTotalActiveJobs() {
@@ -1139,13 +1161,16 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
         logTask(jobKey, `启动子进程 attempt=${attempt} script=${scriptPath}`);
         const child = spawn('node', [scriptPath], {
             env,
-            windowsHide: true
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe', 'ipc']
         });
 
         let output = '';
         let idleTimer = null;
         let finished = false;
         let timedOut = false;
+        let progressUpdates = Promise.resolve();
+        let paymentConfirmed = false;
 
         activeProcesses.add(child);
         const cleanup = () => {
@@ -1159,7 +1184,8 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
             }
             finished = true;
             cleanup();
-            resolve({ attempt, ...result });
+            // 等所有已接收的进度写入结束，再让调用方写终态，禁止迟到回调覆盖成功状态。
+            progressUpdates.then(() => resolve({ attempt, ...result }));
         };
 
         const resetIdleTimer = () => {
@@ -1175,11 +1201,14 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
         };
 
         const appendChunk = (source, chunk) => {
+            if (finished) return;
             const text = chunk.toString();
             output += text;
             logTaskChunk(jobKey, attempt, source, text);
             if (onProgress) {
-                onProgress(getCheckoutProgress(output), output).catch((error) => console.error('[Progress Update Error]', error));
+                const snapshot = output;
+                progressUpdates = progressUpdates.then(() => onProgress(getCheckoutProgress(snapshot), snapshot))
+                    .catch(() => console.error('[Progress Update Error] 写入进度失败'));
             }
             resetIdleTimer();
         };
@@ -1187,6 +1216,9 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
         resetIdleTimer();
         child.stdout.on('data', (chunk) => appendChunk('stdout', chunk));
         child.stderr.on('data', (chunk) => appendChunk('stderr', chunk));
+        child.on('message', message => {
+            if (message?.type === 'payment-confirmed' && message.jobKey === jobKey) paymentConfirmed = true;
+        });
         child.on('error', (error) => {
             output += `\n[SPAWN_ERROR] ${error.message}\n`;
             logTask(jobKey, `attempt=${attempt} 子进程启动失败: ${error.message}`, 'error');
@@ -1199,7 +1231,9 @@ function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = nu
                 signal,
                 timedOut,
                 output,
-                analysis: analyzeProcessOutput(output, timedOut)
+                analysis: paymentConfirmed
+                    ? { status: 'success', message: '激活成功', reachedPayment: true, shouldRetry: false }
+                    : analyzeProcessOutput(output, timedOut)
             });
         });
     });
@@ -1534,7 +1568,7 @@ app.post('/api/external/cards/push', async (req, res) => {
             return res.status(400).json({ success: false, error: '单次导入上限 500 条' });
         }
 
-        const result = await store.importCards(cards);
+        const result = await cardImportService.importCards(cards);
         res.json({ success: true, ...result });
     } catch (error) {
         if (error.message === '单次导入上限 500 条') {
@@ -1596,6 +1630,8 @@ app.post('/api/public/subscription/check', async (req, res) => {
 });
 
 app.use('/api/admin', authenticateAdmin);
+app.get('/api/admin/renewal-jobs', hardeningController.listRenewals);
+app.post('/api/admin/renewal-jobs/:jobKey/retry', requireSecondaryAuth, hardeningController.retryRenewal);
 
 app.get('/subscription', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'subscription.html'));
@@ -1691,17 +1727,22 @@ app.get('/api/admin/login-logs', async (req, res) => {
     }
 });
 
-app.get('/api/admin/secondary/session', (req, res) => {
+app.get('/api/admin/secondary/session', async (req, res) => {
     const token = String(req.headers['x-admin-secondary-token'] || '').trim();
     const payload = adminAuth.verifySecondaryToken(token);
     if (!payload) {
         return res.json({ success: true, verified: false });
     }
-    return res.json({
-        success: true,
-        verified: true,
-        expiresAt: payload.exp
-    });
+    try {
+        const config = await store.getAdminAuthConfig();
+        return res.json({
+            success: true,
+            verified: Number(payload.sv) === config.secondaryPasswordVersion,
+            expiresAt: payload.exp
+        });
+    } catch (_) {
+        return res.status(503).json({ success: false, verified: false, message: '暂时无法验证权限' });
+    }
 });
 
 app.post('/api/admin/verify-secondary', async (req, res) => {
@@ -1710,11 +1751,14 @@ app.post('/api/admin/verify-secondary', async (req, res) => {
     if (!password) {
         return res.status(400).json({ success: false, message: '请输入二级密码' });
     }
+    const rate = adminAuth.checkLoginRateLimit(`secondary:${req.admin?.email || 'admin'}`);
+    if (!rate.allowed) return res.status(429).json({ success: false, message: '二级密码尝试过多，请稍后再试' });
 
     try {
         await ensureStoreReady();
         const authConfig = await store.getAdminAuthConfig();
         if (!verifyPassword(password, authConfig.secondaryPasswordHash)) {
+            adminAuth.recordLoginFailure(rate.key, rate.entry);
             await logAdminSecurityEvent('secondary_failed', {
                 ...clientMeta,
                 email: req.admin?.email || authConfig.email,
@@ -1723,6 +1767,7 @@ app.post('/api/admin/verify-secondary', async (req, res) => {
             return res.status(401).json({ success: false, message: '二级密码错误' });
         }
 
+        adminAuth.clearLoginAttempts(rate.key);
         const { token, payload } = adminAuth.issueSecondaryToken(
             authConfig.secondaryPasswordVersion,
             clientMeta.ip
@@ -2075,9 +2120,11 @@ app.post('/api/admin/subscription/batch-renewal-status', async (req, res) => {
         const concurrency = 3;
         const results = {};
         let cursor = 0;
+        const sessionRows = await store.getSessionsByJobKeys(jobKeys);
+        const sessionsByJob = new Map(sessionRows.map(row => [row.job_key, row]));
 
         async function queryJobRenewalStatus(jobKey) {
-            const session = await store.getSessionByJobKey(jobKey);
+            const session = sessionsByJob.get(jobKey);
             if (!session?.session_payload) {
                 results[jobKey] = { ok: false, error: '无完整 Session' };
                 return;
@@ -2488,7 +2535,16 @@ app.get('/api/admin/gpt-api/status', async (req, res) => {
     }
 });
 
-app.post('/api/admin/config', async (req, res) => {
+app.post('/api/admin/config', (req, res, next) => {
+    if (Array.isArray(req.body?.card_pool) && req.body.card_pool.length > 500 ||
+        Array.isArray(req.body?.phone_pool) && req.body.phone_pool.length > 5000) {
+        return res.status(400).json({ success: false, message: '资产数量超过单次保存上限' });
+    }
+    if (Object.hasOwn(req.body || {}, 'card_pool') || Object.hasOwn(req.body || {}, 'phone_pool')) {
+        return requireSecondaryAuth(req, res, next);
+    }
+    return next();
+}, async (req, res) => {
     try {
         await ensureStoreReady();
         const nextConfig = { ...(req.body || {}) };
@@ -2724,7 +2780,7 @@ app.post('/api/admin/cards/import', requireSecondaryAuth, async (req, res) => {
             return res.status(400).json({ success: false, error: '单次导入上限 500 条' });
         }
 
-        const result = await store.importCards(cards);
+        const result = await cardImportService.importCards(cards);
         res.json({ success: true, ...result });
     } catch (error) {
         if (error.message === '单次导入上限 500 条') {
@@ -3014,7 +3070,7 @@ app.delete('/api/admin/cdks/:cdk', requireSecondaryAuth, async (req, res) => {
 
 // ─── Billing Records API ─────────────────────────────────────────────────────
 
-app.get('/api/admin/billing', async (req, res) => {
+app.get('/api/admin/billing', requireSecondaryAuth, async (req, res) => {
     try {
         await ensureStoreReady();
         const filters = {};
@@ -3031,7 +3087,7 @@ app.get('/api/admin/billing', async (req, res) => {
     }
 });
 
-app.get('/api/admin/billing/export', async (req, res) => {
+app.get('/api/admin/billing/export', requireSecondaryAuth, async (req, res) => {
     try {
         await ensureStoreReady();
         const filters = {};
@@ -3217,6 +3273,7 @@ async function runGptApiWorker({ task, token, session, cdk, planType }) {
     const accountEmail = task.tokenPreview || '';
     let shouldRollbackCdk = true;
     let reservedCard = null;
+    let renewalResult = null;
 
     const setProgress = async (status, progress, message, extra = {}) => {
         await store.updateTaskLog(jobKey, { status, progress, message, ...extra });
@@ -3341,10 +3398,23 @@ async function runGptApiWorker({ task, token, session, cdk, planType }) {
                 const failureDetail = businessResult.error || lastRaw?.error || businessResult.status || rawStatus || 'unknown';
                 finalStatus = succeeded ? 'success' : 'failed';
                 finalMessage = succeeded ? '第三方代充开通成功' : `第三方代充失败: ${failureDetail}`;
+                // 上游已确认充值成功，续费收尾无论成功与否都不能回滚 CDK 或再次充值。
+                if (succeeded) {
+                    shouldRollbackCdk = false;
+                    try {
+                        await hardening.recordPayment({
+                            jobKey, paidAt: new Date().toISOString(), source: 'third-party',
+                            cardId: reservedCard.id, cardLast4: String(reservedCard.card_number).slice(-4),
+                            ownerKey: `gptapi_${jobKey}`, cdk, email: accountEmail
+                        });
+                    } catch (_) {
+                        logTask(jobKey, '上游已确认充值成功，记账暂未完成，请管理员核实；禁止重复充值', 'warn');
+                    }
+                }
                 await setProgress(
-                    finalStatus,
-                    succeeded ? 100 : 99,
-                    finalMessage,
+                    succeeded ? 'running' : finalStatus,
+                    99,
+                    succeeded ? '充值成功，正在关闭自动续费...' : finalMessage,
                     {
                         gptApiRaw: JSON.stringify(lastRaw),
                         gptApiTopupCode: gptApi.extractTopupCode(lastRaw)
@@ -3368,34 +3438,59 @@ async function runGptApiWorker({ task, token, session, cdk, planType }) {
         if (finalStatus === 'success') {
             shouldRollbackCdk = false;
             await store.resetCdkFailure(cdk);
-            await store.recordCardUsage(reservedCard?.id);
-            await store.releaseCard(reservedCard?.id).catch(() => { });
+            await store.releaseCard(reservedCard?.id, `gptapi_${jobKey}`).catch(() => { });
+            renewalResult = await closeAutoRenewAfterRecharge({
+                jobKey,
+                accessToken: token,
+                email: extractEmailFromSession(JSON.stringify(sessionPayload)) || accountEmail,
+                successMessage: finalMessage
+            });
+            finalMessage = renewalResult.message;
+            logTask(jobKey, renewalResult.logMessage, renewalResult.confirmed ? 'log' : 'warn');
+            await setProgress('success', 100, finalMessage);
             notifyTaskOutcome({ event: 'success', email: accountEmail, cdk, jobKey, message: finalMessage });
         } else {
-            await store.releaseCard(reservedCard?.id).catch(() => { });
+            await store.releaseCard(reservedCard?.id, `gptapi_${jobKey}`).catch(() => { });
             notifyTaskOutcome({ event: 'failure', email: accountEmail, cdk, jobKey, message: finalMessage });
         }
     } catch (error) {
         console.error(`[GPT API Task Error] ${jobKey}:`, error);
         logTask(jobKey, `第三方代充任务异常: ${error.message}`, 'error');
-        await store.releaseCard(reservedCard?.id).catch(() => { });
+        await store.releaseCard(reservedCard?.id, `gptapi_${jobKey}`).catch(() => { });
+        // 已支付后即使记账或状态写入异常，也继续取消续费并保留充值成功，不能回滚 CDK。
+        const paid = !shouldRollbackCdk;
+        if (paid && !renewalResult) {
+            renewalResult = await closeAutoRenewAfterRecharge({
+                jobKey,
+                accessToken: token,
+                email: extractEmailFromSession(JSON.stringify(sessionPayload)) || accountEmail,
+                successMessage: '第三方代充开通成功'
+            });
+            logTask(jobKey, renewalResult.logMessage, renewalResult.confirmed ? 'log' : 'warn');
+        }
+        const status = paid ? 'success' : 'failed';
+        const message = paid ? renewalResult.message : error.message;
+        const progress = paid ? 100 : 0;
         await store.updateTaskLog(jobKey, {
-            status: 'failed',
-            message: error.message,
-            progress: 0,
+            status,
+            message,
+            progress,
             cdkCode: cdk
+        }).catch(persistenceError => {
+            if (!paid) throw persistenceError;
+            logTask(jobKey, '充值成功，但任务记录写入失败，请管理员核实记录', 'error');
         });
         broadcastToTask(jobKey, {
             type: 'status',
             jobKey,
-            status: 'failed',
-            message: error.message,
+            status,
+            message,
             cdkCode: cdk,
-            progress: 0
+            progress
         });
-        notifyTaskOutcome({ event: 'failure', email: accountEmail, cdk, jobKey, message: error.message });
+        notifyTaskOutcome({ event: paid ? 'success' : 'failure', email: accountEmail, cdk, jobKey, message });
     } finally {
-        releaseForegroundSlot(jobKey);
+        await releaseForegroundSlot(jobKey);
         if (shouldRollbackCdk) {
             await store.markCdkUnused(cdk).catch(() => { });
             logTask(jobKey, `CDK ${cdk} 已回滚为未使用`);
@@ -3441,6 +3536,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
         const allOutputs = [];
         let shouldRollbackCdk = true;
         let lastProgress = 0;
+        let renewalResult = null;
         const accountEmail = extractEmailFromSession(sessionRaw) || task.tokenPreview || '';
 
         try {
@@ -3513,16 +3609,24 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                 allOutputs.push(`===== ATTEMPT ${attempt}${cardLast4 ? ` | CARD ${cardLast4}` : ''} =====\n${run.output}`);
                 finalRun = { ...run, output: allOutputs.join('\n\n') };
 
-                const currentStatus = run.analysis.status === 'success' ? 'success' : 'running';
+                const paymentSucceeded = run.analysis.status === 'success';
+                if (paymentSucceeded) {
+                    shouldRollbackCdk = false;
+                }
+                // 先展示已充值、正在关闭续费；等收尾结果明确后再广播唯一的成功终态。
+                const currentStatus = 'running';
+                const currentMessage = paymentSucceeded
+                    ? '充值成功，正在关闭自动续费...'
+                    : '正在开通中';
                 const currentProgress = normalizeTaskProgress(
-                    getCheckoutProgress(run.output, currentStatus),
+                    paymentSucceeded ? 99 : getCheckoutProgress(run.output, currentStatus),
                     currentStatus,
                     lastProgress
                 );
                 lastProgress = currentProgress;
                 await store.updateTaskLog(task.jobKey, {
                     status: currentStatus,
-                    message: currentStatus === 'success' ? '激活成功' : '正在开通中',
+                    message: currentMessage,
                     rawOutput: finalRun.output,
                     progress: currentProgress,
                     cdkCode: cdk,
@@ -3534,30 +3638,42 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                     jobKey: task.jobKey,
                     progress: currentProgress,
                     status: currentStatus,
-                    message: currentStatus === 'success' ? '激活成功' : '正在开通中',
+                    message: currentMessage,
                     cdkCode: cdk,
                     cardLast4
                 });
 
-                if (!run.analysis.shouldRetry || attempt >= MAX_PROCESS_ATTEMPTS) {
+                if (paymentSucceeded || !run.analysis.shouldRetry || attempt >= MAX_PROCESS_ATTEMPTS) {
                     logTask(task.jobKey, `尝试 ${attempt} 结束，status=${run.analysis.status} shouldRetry=${run.analysis.shouldRetry}`);
                     break;
                 }
                 logTask(task.jobKey, `尝试 ${attempt} 失败，准备重试`, 'warn');
             }
 
-            const rawOutput = finalRun?.output || '';
+            let rawOutput = finalRun?.output || '';
             const normalizedAnalysis = finalRun?.analysis?.status === 'retry'
                 ? { ...finalRun.analysis, status: 'failed', message: String(finalRun.analysis.message || '激活失败').replace('，准备重试', '') }
                 : finalRun?.analysis;
             const finalStatus = normalizedAnalysis?.status || 'failed';
+            let finalMessage = normalizedAnalysis?.message || null;
+            if (finalStatus === 'success') {
+                renewalResult = await closeAutoRenewAfterRecharge({
+                    jobKey: task.jobKey,
+                    accessToken: token,
+                    email: accountEmail,
+                    successMessage: finalMessage || '激活成功'
+                });
+                finalMessage = renewalResult.message;
+                rawOutput += `\n${renewalResult.logMessage}`;
+                logTask(task.jobKey, renewalResult.logMessage, renewalResult.confirmed ? 'log' : 'warn');
+            }
 
             const finalProgress = normalizeTaskProgress(finalStatus === 'success' ? 100 : lastProgress, finalStatus, lastProgress);
             const taskMedia = extractTaskMediaFromOutput(rawOutput);
             const failureScreenshots = [...taskMedia.screenshots, ...taskMedia.videos];
             await store.updateTaskLog(task.jobKey, {
                 status: finalStatus,
-                message: normalizedAnalysis?.message || null,
+                message: finalMessage,
                 rawOutput,
                 cdkCode: cdk,
                 progress: finalProgress,
@@ -3568,7 +3684,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                 type: 'status',
                 jobKey: task.jobKey,
                 status: finalStatus,
-                message: normalizedAnalysis?.message,
+                message: finalMessage,
                 cdkCode: cdk,
                 progress: finalProgress,
                 screenshots: taskMedia.screenshots,
@@ -3577,7 +3693,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
 
             logTask(
                 task.jobKey,
-                `任务结束 status=${finalStatus} progress=${finalProgress} message=${normalizedAnalysis?.message || ''}`
+                `任务结束 status=${finalStatus} progress=${finalProgress} message=${finalMessage || ''}`
             );
 
             if (finalStatus === 'success') {
@@ -3591,7 +3707,7 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                     email: accountEmail,
                     cdk,
                     jobKey: task.jobKey,
-                    message: normalizedAnalysis?.message || '激活成功'
+                    message: finalMessage || '激活成功'
                 });
             } else if (isCardPoolExhaustedIssue(rawOutput, normalizedAnalysis)) {
                 notifyTaskOutcome({
@@ -3653,34 +3769,53 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
         } catch (bgError) {
             console.error(`[Background Task Error] ${task.jobKey}:`, bgError);
             logTask(task.jobKey, `后台任务异常: ${bgError.message}`, 'error');
+            // 收尾异常不能把已扣款的充值改成失败；缓存续费结果，避免重复发起取消操作。
+            const paid = !shouldRollbackCdk;
+            if (paid && !renewalResult) {
+                renewalResult = await closeAutoRenewAfterRecharge({
+                    jobKey: task.jobKey,
+                    accessToken: token,
+                    email: accountEmail,
+                    successMessage: '激活成功'
+                });
+                logTask(task.jobKey, renewalResult.logMessage, renewalResult.confirmed ? 'log' : 'warn');
+            }
+            const status = paid ? 'success' : 'failed';
+            const message = paid ? renewalResult.message : bgError.message;
+            const progress = paid ? 100 : normalizeTaskProgress(lastProgress, 'failed', lastProgress);
             await store.updateTaskLog(task.jobKey, {
-                status: 'failed',
-                message: bgError.message,
-                rawOutput: bgError.message,
+                status,
+                message,
+                rawOutput: paid
+                    ? `${finalRun?.output || ''}\n${renewalResult.logMessage}`
+                    : bgError.message,
                 cdkCode: cdk,
-                progress: normalizeTaskProgress(lastProgress, 'failed', lastProgress)
+                progress
+            }).catch(persistenceError => {
+                if (!paid) throw persistenceError;
+                logTask(task.jobKey, '充值成功，但任务记录写入失败，请管理员核实记录', 'error');
             });
             broadcastToTask(task.jobKey, {
                 type: 'status',
                 jobKey: task.jobKey,
-                status: 'failed',
-                message: bgError.message,
+                status,
+                message,
                 cdkCode: cdk,
-                progress: normalizeTaskProgress(lastProgress, 'failed', lastProgress)
+                progress
             });
             notifyTaskOutcome({
-                event: 'failure',
+                event: paid ? 'success' : 'failure',
                 email: accountEmail,
                 cdk,
                 jobKey: task.jobKey,
-                message: bgError.message
+                message
             });
             if (shouldRollbackCdk) {
                 await store.markCdkUnused(cdk);
                 logTask(task.jobKey, `CDK ${cdk} 已回滚为未使用`);
             }
         } finally {
-            releaseForegroundSlot(task.jobKey);
+            await releaseForegroundSlot(task.jobKey);
             if (getTotalActiveJobs() === 0) {
                 const maintenanceModeState = await store.getMaintenanceModeState();
                 if (maintenanceModeState.enabled && maintenanceModeState.drain) {
@@ -3692,121 +3827,11 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
 }
 
 async function handleActivationRequest(req, res) {
-    const rawSession = String(req.body?.session || req.body?.token || '').trim();
-    const sessionJson = parseSessionJson(rawSession);
-    const token = normalizeSessionToken(rawSession);
-    const cdk = String(req.body?.cdk || '').trim();
-    const clientIp = getClientIp(req);
-    console.log(`[Activation] 收到开通请求 path=${req.path} cdk=${cdk} session_json=${Boolean(sessionJson)} token_len=${token.length}`);
-    if (!token) {
-        return res.status(400).json({ success: false, message: '缺少 Session JSON 或 AccessToken' });
-    }
-    if (!cdk) {
-        return res.status(400).json({ success: false, message: '缺少 CDK' });
-    }
-    const tokenCheck = validateAccessToken(token);
-    if (!tokenCheck.valid) {
-        return res.status(400).json({ success: false, message: tokenCheck.message });
-    }
-
     try {
         await ensureStoreReady();
-        const maintenanceModeState = await store.getMaintenanceModeState();
-        if (maintenanceModeState.enabled) {
-            return res.status(503).json({ success: false, message: '系统维护中，请稍后再试' });
-        }
-        const maxConcurrentActivations = await store.getMaxConcurrentActivations();
-        if (activeForegroundJobs.size >= maxConcurrentActivations) {
-            return res.status(429).json({ success: false, message: '当前任务过多，请稍后再试' });
-        }
-
-        const cdkDetails = await store.verifyCdkDetails(cdk);
-        const runningTask = cdkDetails ? await store.getRunningTaskByCdk(cdk) : null;
-        if (runningTask) {
-            return res.json({
-                success: true,
-                jobKey: runningTask.job_key,
-                message: runningTask.message || '该 CDK 正在开通中，已为您恢复等待进度'
-            });
-        }
-        if (!cdkDetails || cdkDetails.used_at || cdkDetails.type !== '自助') {
-            return res.status(403).json({ success: false, message: 'CDK 无效、已使用或非自助激活码' });
-        }
-
-        const cdkCooldownMinutes = getRemainingCooldownMinutes(cdkDetails.cooldown_until);
-        if (cdkCooldownMinutes > 0) {
-            return res.status(403).json({
-                success: false,
-                message: `该卡密连续无资格尝试过多，请冷静 ${cdkCooldownMinutes} 分钟后再试`
-            });
-        }
-
-        if (clientIp) {
-            const ipAttemptLimit = await store.getActivationAttemptLimit('ip', clientIp);
-            const ipCooldownMinutes = getRemainingCooldownMinutes(ipAttemptLimit?.cooldown_until);
-            if (ipCooldownMinutes > 0) {
-                return res.status(403).json({
-                    success: false,
-                    message: `当前 IP 连续无资格尝试过多，请冷静 ${ipCooldownMinutes} 分钟后再试`
-                });
-            }
-        }
-
-        // 判断是否走第三方代充 API 模式（后台「系统配置」开启后生效）
-        const gptApiConfig = await store.getGptApiConfig();
-        const useGptApi = gptApiConfig.enabled && Boolean(gptApiConfig.api_key);
-
-        if (!useGptApi) {
-            const hasCard = await store.hasAvailableCard();
-            if (!hasCard) {
-                const poolEmail = extractEmailFromSession(rawSession);
-                fireTelegramNotification('card_pool_empty', {
-                    email: poolEmail,
-                    cdk,
-                    message: '银行卡池暂无可用卡片，任务未启动'
-                });
-                return res.status(503).json({
-                    success: false,
-                    message: '银行卡池暂无可用卡片，请先在后台「银行卡池」导入银行卡后再试'
-                });
-            }
-        }
-
-        const lockSuccess = await store.markCdkUsed(cdk);
-        if (!lockSuccess) {
-            return res.status(403).json({ success: false, message: 'CDK 不可用或正在被他人使用' });
-        }
-
-        const storedSession = buildStoredSessionPayload(rawSession, sessionJson, token);
-        const task = await store.createTaskLog({
-            tokenPreview: extractSessionPreview(storedSession),
-            sessionPayload: storedSession,
-            cdkCode: cdk,
-            phone: null,
-            cardLast4: null,
-            status: 'running',
-            progress: 3
-        });
-
-        logTask(task.jobKey, `任务已创建，CDK=${cdk} mode=${useGptApi ? 'gpt-api' : 'local'}`);
-        reserveForegroundSlot(task.jobKey);
-
-        if (useGptApi) {
-            runGptApiWorker({ task, token, session: JSON.parse(storedSession), cdk, planType: cdkDetails.plan_type || 'plus' }).catch((error) => {
-                console.error(`[GPT API Worker] ${task.jobKey}:`, error);
-            });
-        } else {
-            spawnActivationWorker({ task, token, sessionRaw: storedSession, cdk, cdkDetails, clientIp });
-        }
-
-        return res.json({
-            success: true,
-            jobKey: task.jobKey,
-            message: '任务已启动，正在为您开通中...'
-        });
-    } catch (error) {
-        try { await store.markCdkUnused(cdk); } catch (_) { }
-        return res.status(500).json({ success: false, message: error.message });
+        return await activationController(req, res);
+    } catch (_) {
+        return res.status(503).json({ success: false, message: '暂时无法启动任务' });
     }
 }
 
@@ -3834,6 +3859,7 @@ app.post('/api/verify-cdk', async (req, res) => {
                     plan_label: getPlanTypeLabel(cdkData.plan_type || 'plus'),
                     status: 'processing',
                     jobKey: runningTask.job_key,
+                    taskToken: hardening.access.issue(runningTask.job_key),
                     message: runningTask.message || '当前 CDK 正在开通中'
                 }
             });
@@ -3915,6 +3941,9 @@ app.get('/api/cdk/download', async (req, res) => {
 
 async function start() {
     await ensureStoreReady();
+    await hardening.initialize();
+    if (process.env.COMPENSATION_ENABLED !== '0') hardening.start();
+    setInterval(() => hardening.heartbeat([...activeForegroundJobs]).catch(() => {}), 15000).unref();
 
     try {
         const poolInfo = await syncBrowserPoolModeFromStore();
@@ -3937,12 +3966,12 @@ async function start() {
         console.error(`[BrowserPool] 初始化失败: ${error.message}`);
     }
 
-    // 启动时把所有遗留的 in_use 锁清空（避免上次崩溃残留的锁卡死整个池）
+    // 多实例启动时不能清空其他进程的资产锁，只回收超时且没有活跃任务租约的资产。
     try {
-        await store.resetAllAssetLocks();
-        console.log('🔓 [资产锁] 启动时已重置所有 in_use 标记');
+        await store.releaseStaleAssetLocks();
+        console.log('🔓 [资产锁] 启动时已检查过期资产租约');
     } catch (error) {
-        console.error(`❌ [资产锁] 启动重置失败: ${error.message}`);
+        console.error(`❌ [资产锁] 启动检查失败: ${error.message}`);
     }
 
     // 每 60 秒兜底回收一次"超过 15 分钟仍未释放"的锁（防进程崩溃）
@@ -3971,7 +4000,7 @@ async function start() {
     });
 
     // WebSocket Server Setup
-    const wss = new WebSocket.Server({ server });
+    const wss = new WebSocket.Server({ server, maxPayload: 64 * 1024 });
     wss.on('connection', (ws) => {
         let currentJobKey = null;
 
@@ -3988,6 +4017,17 @@ async function start() {
                     return;
                 }
                 if (data.type === 'subscribe' && data.jobKey) {
+                    let authorized = hardening.access.verify(data.taskToken, data.jobKey);
+                    if (!authorized && data.adminToken) {
+                        const admin = verifyAdminToken(data.adminToken);
+                        const config = admin ? await store.getAdminAuthConfig() : null;
+                        authorized = Boolean(admin && Number(admin.pv) === config?.passwordVersion);
+                    }
+                    if (!authorized) {
+                        ws.send(JSON.stringify({ type: 'error', code: 'TASK_UNAUTHORIZED', message: '任务访问授权无效或已过期' }));
+                        ws.close(1008, 'Unauthorized');
+                        return;
+                    }
                     if (currentJobKey && currentJobKey !== data.jobKey) {
                         unsubscribeTaskClient(currentJobKey, ws);
                     }

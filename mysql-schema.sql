@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS card_assets (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_card_assets_sort (sort_order, id),
+    UNIQUE KEY uniq_card_assets_number (card_number),
     KEY idx_card_assets_pick (is_active, in_use, locked_at, usage_count)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

@@ -373,10 +373,23 @@ function pickDefaultLogin2faMethod(methods = [], preferred = '') {
 }
 
 function createRequireSecondaryAuth(store, ensureStoreReady) {
-    // 已取消后台二级密码：直接放行，仅保留管理员登录鉴权（authenticateAdmin）
     return async function requireSecondaryAuth(req, res, next) {
-        req.secondaryAuth = { bypassed: true };
-        return next();
+        const payload = verifySecondaryToken(String(req.headers['x-admin-secondary-token'] || ''));
+        if (!payload) {
+            return res.status(403).json({ success: false, code: 'SECONDARY_REQUIRED', message: '请先验证二级密码' });
+        }
+        try {
+            await ensureStoreReady();
+            const config = await store.getAdminAuthConfig();
+            // 二级密码变更后，旧令牌即使尚未过期也必须失效。
+            if (Number(payload.sv) !== config.secondaryPasswordVersion) {
+                return res.status(403).json({ success: false, code: 'SECONDARY_REQUIRED', message: '二级验证已失效' });
+            }
+            req.secondaryAuth = payload;
+            return next();
+        } catch (_) {
+            return res.status(503).json({ success: false, message: '暂时无法验证权限' });
+        }
     };
 }
 

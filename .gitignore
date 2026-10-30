@@ -5,6 +5,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # Local env / secrets
+.local/
 .env
 .env.*
 !.env.example
@@ -17,6 +18,8 @@ debug_screenshots/
 product_files/
 data/hcaptcha-config.json
 data/browser-pool/
+data/task-access.secret
+data/payment-outbox/
 scratch/
 mail.txt
 

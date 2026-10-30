@@ -439,12 +439,18 @@ async function cancelAutoRenew(accessToken, options = {}) {
         return {
             ok: false,
             statusCode: 400,
+            code: 'unsupported_subscription_channel',
             error: `该订阅来自 ${subscription.subscriptionChannel}，无法通过 API 取消，请在对应平台关闭续费`
         };
     }
 
     if (!subscription.hasActiveSubscription) {
-        return { ok: false, statusCode: 400, error: '账号当前无有效订阅，无需取消自动续费' };
+        return {
+            ok: false,
+            statusCode: 400,
+            code: 'subscription_not_active',
+            error: '账号当前无有效订阅，无需取消自动续费'
+        };
     }
 
     if (subscription.autoRenewRaw === false) {

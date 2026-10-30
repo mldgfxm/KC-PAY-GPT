@@ -2954,6 +2954,12 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             </div>
 
             <div class="panel">
+                <h2 class="panel-title">自动关闭续费补偿</h2>
+                <p>失败任务会自动重试；Session 失效时，可在下方粘贴原账号的新 Session 后点击重新排队。</p>
+                <button type="button" class="btn btn-secondary" onclick="loadRenewalJobs()">刷新补偿状态</button>
+                <div id="renewal_jobs" aria-live="polite" style="margin-top:16px;overflow:auto"></div>
+            </div>
+            <div class="panel">
                 <h2 class="panel-title">Session</h2>
                 <p style="font-size: 13px; color: var(--text-dim); margin: 12px 0;">
                     从 <code>chatgpt.com/api/auth/session</code> 复制完整 JSON，或只粘贴 AccessToken。
@@ -3620,6 +3626,78 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             redirectToLogin();
         }
 
+        let adminSecondaryToken = '';
+        let secondaryVerification = null;
+
+        async function loadRenewalJobs() {
+            try {
+                const response = await authFetch('/api/admin/renewal-jobs');
+                const payload = await response.json();
+                if (!response.ok) throw new Error('读取补偿状态失败');
+                const labels = { pending: '等待处理', running: '处理中', retry: '等待重试', confirmed: '已确认关闭', manual: '需要人工处理' };
+                const container = document.getElementById('renewal_jobs');
+                if (!(payload.jobs || []).length) {
+                    container.textContent = '暂无自动续费补偿任务';
+                    return;
+                }
+                container.innerHTML = '<table><thead><tr><th>任务</th><th>状态</th><th>尝试次数</th><th>说明</th><th>操作</th></tr></thead><tbody>' +
+                    (payload.jobs || []).map(job => '<tr><td>' + escapeHtml(job.job_key) + '</td><td>' +
+                        escapeHtml(labels[job.state] || job.state) + '</td><td>' + Number(job.attempts) + '</td><td>' +
+                        escapeHtml(job.last_message || '') + '</td><td>' +
+                        (['manual', 'retry'].includes(job.state)
+                            ? '<button type="button" class="btn btn-secondary" data-renewal-job="' + escapeHtml(job.job_key) + '">重新排队</button>' : '') +
+                        '</td></tr>').join('') + '</tbody></table>';
+                container.querySelectorAll('[data-renewal-job]').forEach(button => {
+                    button.onclick = async () => {
+                        button.disabled = true;
+                        try {
+                            const result = await authFetch('/api/admin/renewal-jobs/' + encodeURIComponent(button.dataset.renewalJob) + '/retry', {
+                                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ session: document.getElementById('cancel_renewal_session').value.trim() })
+                            });
+                            const data = await result.json();
+                            if (!data.success) throw new Error(data.message || '重新排队失败');
+                            await loadRenewalJobs();
+                        } catch (error) { showMessage(error.message, 'error'); button.disabled = false; }
+                    };
+                });
+            } catch (error) { showMessage(error.message, 'error'); }
+        }
+
+        async function requestSecondaryVerification() {
+            if (secondaryVerification) return secondaryVerification;
+            secondaryVerification = new Promise(resolve => {
+                const dialog = document.createElement('dialog');
+                dialog.className = 'panel';
+                dialog.style.maxWidth = '420px';
+                dialog.setAttribute('aria-labelledby', 'secondary-verification-title');
+                dialog.innerHTML = '<form method="dialog"><h2 id="secondary-verification-title">二级安全验证</h2>' +
+                    '<p>查看或修改敏感资料前，请输入二级密码。</p>' +
+                    '<label>二级密码<input type="password" autocomplete="current-password" required style="width:100%;margin:16px 0"></label>' +
+                    '<button class="btn btn-primary" value="verify">验证</button> ' +
+                    '<button class="btn btn-secondary" type="button">取消</button></form>';
+                document.body.appendChild(dialog);
+                const finish = value => { dialog.close(); dialog.remove(); resolve(value); };
+                dialog.querySelector('form').onsubmit = event => {
+                    event.preventDefault();
+                    finish(dialog.querySelector('input').value);
+                };
+                dialog.querySelector('button[type="button"]').onclick = () => finish(null);
+                dialog.oncancel = event => { event.preventDefault(); finish(null); };
+                dialog.showModal();
+            }).then(async password => {
+                if (!password) throw new Error('已取消二级验证');
+                const response = await fetch('/api/admin/verify-secondary', {
+                    method: 'POST', headers: { Authorization: `Bearer ${getAdminToken()}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const payload = await response.json();
+                if (!response.ok || !payload.success) throw new Error(payload.message || '二级验证失败');
+                adminSecondaryToken = payload.secondaryToken;
+            }).finally(() => { secondaryVerification = null; });
+            return secondaryVerification;
+        }
+
         async function authFetch(url, options = {}) {
             const token = getAdminToken();
             if (!token) {
@@ -3628,7 +3706,13 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             }
 
             const headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` };
-            const response = await fetch(url, { ...options, headers });
+            if (adminSecondaryToken) headers['X-Admin-Secondary-Token'] = adminSecondaryToken;
+            let response = await fetch(url, { ...options, headers });
+            if (response.status === 403 && (await response.clone().json().catch(() => ({}))).code === 'SECONDARY_REQUIRED') {
+                adminSecondaryToken = '';
+                await requestSecondaryVerification();
+                response = await fetch(url, { ...options, headers: { ...headers, 'X-Admin-Secondary-Token': adminSecondaryToken } });
+            }
             if (response.status === 401) {
                 redirectToLogin();
                 throw new Error('登录已失效');
@@ -4796,6 +4880,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
         }
 
         function switchPageInternal(pId, el) {
+            if (pId === 'cancel_renewal') loadRenewalJobs();
             document.querySelectorAll('.nav-item.active').forEach((i) => i.classList.remove('active'));
             const page = document.getElementById(pId);
             if (!page) {
@@ -5131,7 +5216,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                 document.getElementById('stat_billing_revenue').innerText = billingRevenue.toFixed(2);
                 document.getElementById('stat_billing_revenue_meta').innerText = `成功账单累计 (${billingCurrency})`;
                 document.getElementById('stat_billing_paid_count').innerText = data.stats.billing_paid_count || 0;
-                document.getElementById('stat_card_total').innerText = (data.config.card_pool || []).length;
+                document.getElementById('stat_card_total').innerText = Number(data.config.card_pool_count || 0);
                 document.getElementById('stat_foreground_slots').innerText = `${Number(data.runtime?.active_foreground_jobs || 0)}/${Number(data.config.max_concurrent_activations || 1)}`;
                 const pool = data.runtime?.browser_pool;
                 const poolMeta = (pool?.enabled && pool?.size)
@@ -5141,7 +5226,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
 
                 if (isInitial) {
                     applySystemConfigFromData(data);
-                    loadCardPoolList();
+                    if (document.getElementById('cards')?.classList.contains('active')) loadCardPoolList();
                 }
 
                 window.__adminRuntime = data.runtime || { active_activation_jobs: 0 };
@@ -7295,7 +7380,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     socket.onopen = () => {
                         clearTimeout(reconnectTimer);
                         reconnectTimer = null;
-                        socket.send(JSON.stringify({ type: 'subscribe', jobKey: data.jobKey }));
+                        socket.send(JSON.stringify({ type: 'subscribe', jobKey: data.jobKey, adminToken: getAdminToken() }));
                         startHeartbeat();
                     };
 

@@ -459,7 +459,7 @@
                         showStatus(data.data?.message || '检测到当前 CDK 正在开通中，正在恢复任务进度...', 'success');
                         step1.style.display = 'none';
                         step2.style.display = 'block';
-                        initWebSocket(data.data.jobKey);
+                        initWebSocket(data.data.jobKey, data.data.taskToken);
                         return;
                     }
 
@@ -502,6 +502,7 @@
         let socketHeartbeatInterval = null;
         let socketHeartbeatTimeout = null;
         let activeJobKey = '';
+        let activeTaskToken = '';
         let taskCompleted = false;
         const WS_HEARTBEAT_INTERVAL_MS = 15000;
         const WS_HEARTBEAT_TIMEOUT_MS = 45000;
@@ -547,6 +548,7 @@
             }
             socket = null;
             activeJobKey = '';
+            activeTaskToken = '';
         }
 
         function resetRedeemFlow(options = {}) {
@@ -631,15 +633,18 @@
             }
         }
 
-        function initWebSocket(jobKey) {
+        function initWebSocket(jobKey, taskToken) {
             if (!jobKey) {
                 return;
             }
 
             activeJobKey = jobKey;
+            if (taskToken) activeTaskToken = taskToken;
 
             if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-                socket.send(JSON.stringify({ type: 'subscribe', jobKey }));
+                if (socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'subscribe', jobKey, taskToken: activeTaskToken }));
+                }
                 return;
             }
 
@@ -648,7 +653,7 @@
 
             socket.onopen = () => {
                 clearTimeout(reconnectTimer);
-                socket.send(JSON.stringify({ type: 'subscribe', jobKey }));
+                socket.send(JSON.stringify({ type: 'subscribe', jobKey, taskToken: activeTaskToken }));
                 startSocketHeartbeat();
             };
 
@@ -657,6 +662,12 @@
                     const data = JSON.parse(event.data);
                     if (data.type === 'pong') {
                         scheduleSocketHeartbeatTimeout();
+                        return;
+                    }
+                    if (data.code === 'TASK_UNAUTHORIZED') {
+                        closeTaskSocket();
+                        setActivationLock(false);
+                        showStatus('任务授权已失效，请重新验证 CDK 恢复进度', 'error');
                         return;
                     }
                     if (data.jobKey && activeJobKey && data.jobKey !== activeJobKey) {
@@ -722,7 +733,7 @@
                 if (data.success && data.jobKey) {
                     setProgress(8, '任务已启动，正在开通中...');
                     showStatus('任务已启动，正在为您开通中...', 'success');
-                    initWebSocket(data.jobKey);
+                    initWebSocket(data.jobKey, data.taskToken);
                 } else {
                     hideProgress();
                     updateFlowUI(2, 'failed');

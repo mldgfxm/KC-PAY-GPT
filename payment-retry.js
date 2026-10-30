@@ -12,8 +12,10 @@
 
 const store = require('./mysql-store');
 const { completeStripeCardPayment, readCheckoutDueAmount, estimateTaxFreeAmount } = require('./stripe-payment');
-const { pickBillingAddressForCheckout, markAddressBound } = require('./tax-free-address');
+const { pickBillingAddressForCheckout } = require('./tax-free-address');
 const { getRegionConfig } = require('./region-config');
+const { getHardeningService } = require('./hardening/factory');
+const crypto = require('node:crypto');
 
 const MAX_CARD_ATTEMPTS = Number(process.env.PAYMENT_MAX_CARD_ATTEMPTS) || 3;
 const MAX_AUTOMATION_ATTEMPTS = MAX_CARD_ATTEMPTS;
@@ -65,6 +67,14 @@ async function resolveBilledAmountForRecord(page, paymentResult, preTaxAmount, c
  */
 async function executePaymentWithRetry(page, options) {
     const { planType, cdkCode, email, onProgress, stripeSessionId } = options || {};
+    const safety = getHardeningService();
+    const jobKey = process.env.JOB_KEY || stripeSessionId ||
+        (cdkCode ? `payment-${crypto.createHash('sha256').update(cdkCode).digest('hex').slice(0, 48)}` : crypto.randomUUID());
+    const existingPayment = await safety.getPayment(jobKey);
+    if (existingPayment) {
+        console.log('PAYMENT_SUCCESS');
+        return { success: true, paymentConfirmed: true, cardLast4: existingPayment.cardLast4, screenshots: [] };
+    }
 
     const progress = (msg) => {
         console.log(`[PaymentRetry] ${msg}`);
@@ -89,7 +99,7 @@ async function executePaymentWithRetry(page, options) {
     const addressSource = address.generated ? '随机生成' : `地址池 #${address.id}`;
     progress(`已选取美国免税账单地址 (${addressSource}): ${address.line1}, ${address.city}, ${address.state}`);
 
-    const ownerKey = cdkCode
+    const ownerKey = process.env.JOB_KEY ? `payment_${process.env.JOB_KEY}` : cdkCode
         ? `payment_${cdkCode}_${Date.now()}`
         : `payment_debug_${Date.now()}`;
 
@@ -157,41 +167,51 @@ async function executePaymentWithRetry(page, options) {
             }
 
             if (paymentResult.success) {
-                const resolved = await resolveBilledAmountForRecord(
-                    page,
-                    paymentResult,
-                    billedAmount,
-                    billedCurrency
-                );
-                billedAmount = resolved.amount;
-                billedCurrency = resolved.currency;
-                progress(`实际扣款金额（免税后）: ${billedCurrency} ${billedAmount}`);
-
-                const holderName = paymentResult.holderName || card.card_holder || billingHolderName || '';
-                await store.bindCardPaymentProfile(card.id, { holderName, address });
-                if (address.id) {
-                    await markAddressBound(address.id, card.id);
-                }
-                await store.recordCardUsage(card.id);
-                await store.releaseCard(card.id);
+                // 支付事实必须先通知父进程。之后任何本地写库/截图异常，都不能被解释为未扣款。
                 cardHandled = true;
-                await store.createBillingRecord({
-                    card_number: card.card_number,
-                    card_last4: cardLast4,
-                    amount: billedAmount,
-                    currency: billedCurrency,
-                    plan_type: planType || 'plus',
-                    cdk_code: cdkCode,
-                    email,
-                    stripe_session_id: stripeSessionId || null,
-                    status: 'success'
-                });
+                try {
+                    if (typeof process.send === 'function') process.send({ type: 'payment-confirmed', jobKey }, () => {});
+                } catch (_) { /* 父进程断开时仍保留成功结果，并通过本地 outbox 记账。 */ }
+                console.log('PAYMENT_SUCCESS');
+                let bookkeepingPending = false;
+                const holderName = paymentResult.holderName || card.card_holder || billingHolderName || '';
+                try {
+                    // 页面可能已跳转或关闭；金额补读失败不能阻止保存已有的支付事实。
+                    try {
+                        const resolved = await resolveBilledAmountForRecord(
+                            page,
+                            paymentResult,
+                            billedAmount,
+                            billedCurrency
+                        );
+                        billedAmount = resolved.amount;
+                        billedCurrency = resolved.currency;
+                    } catch (_) {
+                        progress('扣款金额补读失败，先保存已确认的支付结果供后台核实');
+                    }
+                    progress(`实际扣款金额（免税后）: ${billedCurrency} ${billedAmount}`);
+
+                    const record = await safety.recordPayment({
+                        jobKey, cardId: card.id, cardLast4, holderName, address, ownerKey,
+                        paidAt: new Date().toISOString(),
+                        amount: billedAmount,
+                        currency: billedCurrency,
+                        planType: planType || 'plus',
+                        cdk: cdkCode,
+                        email,
+                        stripeSessionId: stripeSessionId || null
+                    });
+                    bookkeepingPending = !record.recorded;
+                } catch (_) {
+                    bookkeepingPending = true;
+                    progress('支付已确认，记账暂未完成，请管理员核实；禁止重新支付');
+                }
                 progress(`支付成功！卡片: ...${cardLast4}，姓名: ${holderName}，地址: ${address.line1}, ${address.city}`);
                 if (paymentResult.screenshot) {
                     screenshots.push(paymentResult.screenshot);
                     progress(`SUCCESS_SCREENSHOT: ${paymentResult.screenshot}`);
                 }
-                return { success: true, cardLast4, holderName, screenshots };
+                return { success: true, paymentConfirmed: true, bookkeepingPending, cardLast4, holderName, screenshots };
             }
 
             lastError = paymentResult.error || '支付失败';
@@ -266,7 +286,7 @@ async function executePaymentWithRetry(page, options) {
             };
         } finally {
             if (card?.id && !cardHandled) {
-                await store.releaseCard(card.id).catch(() => { });
+                await store.releaseCard(card.id, ownerKey).catch(() => { });
             }
         }
     }

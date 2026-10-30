@@ -1,7 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const mysql = require('mysql2/promise');
+const { getPool } = require('./database/pool');
+const { SUPPORTED_REGIONS, DEFAULT_REGION } = require('./region-config');
 const {
     substituteProxySession,
     hashProxyUrl,
@@ -24,31 +25,6 @@ const DEFAULT_ADMIN_SECONDARY_PASSWORD = String(process.env.ADMIN_SECONDARY_PASS
 const DEFAULT_ADMIN_LOGIN_PATH = String(process.env.ADMIN_LOGIN_PATH || 'admin-login').trim().toLowerCase();
 const DEFAULT_ADMIN_PANEL_PATH = String(process.env.ADMIN_PANEL_PATH || 'admin').trim().toLowerCase();
 const { normalizeAdminPaths } = require('./admin-paths');
-
-let pool = null;
-
-function getPool() {
-    if (!pool) {
-        pool = mysql.createPool({
-            host: DB_HOST,
-            port: DB_PORT,
-            user: DB_USER,
-            password: DB_PASSWORD,
-            database: DB_NAME,
-            charset: 'utf8mb4',
-            waitForConnections: true,
-            // 10 并发任务 × 每任务最多 3 个子流程同时操作 DB + 后台/前台请求，保守预留 60
-            connectionLimit: Number(process.env.DB_POOL_LIMIT || 60),
-            queueLimit: 0,
-            namedPlaceholders: false,
-            multipleStatements: true,
-            enableKeepAlive: true,
-            keepAliveInitialDelay: 10000
-        });
-    }
-
-    return pool;
-}
 
 // 资产占用最长保留时间（ms），超过这个时长仍未释放视为崩溃，自动回收
 const ASSET_LOCK_STALE_MS = Number(process.env.ASSET_LOCK_STALE_MS || 15 * 60 * 1000);
@@ -208,14 +184,8 @@ async function ensureAdminSecurityDefaults() {
         ['admin_login_path', DEFAULT_ADMIN_LOGIN_PATH],
         ['admin_panel_path', DEFAULT_ADMIN_PANEL_PATH]
     ];
-    for (const [key, value] of defaults) {
-        await runExecute(
-            `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?)
-             ON DUPLICATE KEY UPDATE config_value = config_value`,
-            [key, value]
-        );
-    }
+    await runQuery(`INSERT INTO app_config (config_key, config_value) VALUES ?
+        ON DUPLICATE KEY UPDATE config_value = app_config.config_value`, [defaults]);
 }
 
 async function ensureHcaptchaConfigDefaults() {
@@ -229,14 +199,8 @@ async function ensureHcaptchaConfigDefaults() {
         ['hcaptcha_solver_no_vlm', '0'],
         ['hcaptcha_cdp_port', '9222']
     ];
-    for (const [key, value] of defaults) {
-        await runExecute(
-            `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?)
-             ON DUPLICATE KEY UPDATE config_value = config_value`,
-            [key, value]
-        );
-    }
+    await runQuery(`INSERT INTO app_config (config_key, config_value) VALUES ?
+        ON DUPLICATE KEY UPDATE config_value = app_config.config_value`, [defaults]);
 }
 
 // ─── 第三方 GPT 代充 API 配置 ────────────────────────────────────────────────
@@ -265,14 +229,8 @@ async function ensureGptApiConfigDefaults() {
         ['gpt_api_country', 'PH'],
         ['gpt_api_currency', 'PHP']
     ];
-    for (const [key, value] of defaults) {
-        await runExecute(
-            `INSERT INTO app_config (config_key, config_value)
-             VALUES (?, ?)
-             ON DUPLICATE KEY UPDATE config_value = config_value`,
-            [key, value]
-        );
-    }
+    await runQuery(`INSERT INTO app_config (config_key, config_value) VALUES ?
+        ON DUPLICATE KEY UPDATE config_value = app_config.config_value`, [defaults]);
 }
 
 async function getGptApiConfig() {
@@ -489,11 +447,23 @@ async function cleanupStaleLegacyTasks() {
     }
 }
 
+async function ensureCardNumberUnique() {
+    const indexes = await runQuery("SHOW INDEX FROM card_assets WHERE Key_name = 'uniq_card_assets_number'");
+    if (indexes.length) return;
+    const duplicates = await runQuery('SELECT COUNT(*) AS total FROM (SELECT card_number FROM card_assets GROUP BY card_number HAVING COUNT(*) > 1) d');
+    // 不自动删除重复凭据或正在使用的卡片；迁移前先由管理员核实并合并。
+    if (Number(duplicates[0].total)) throw new Error('存在重复卡号，请备份并合并重复卡片后重启，未修改原有数据');
+    try { await runQuery('ALTER TABLE card_assets ADD UNIQUE KEY uniq_card_assets_number (card_number)'); }
+    catch (error) { if (!/Duplicate key name/i.test(error.message)) throw error; }
+}
+
 async function ensureReady() {
     const schemaSql = fs.readFileSync(SCHEMA_PATH, 'utf8');
     await runQuery(schemaSql);
     await ensureLegacyColumns();
     await ensureGptApiColumns();
+    await runQuery(fs.readFileSync(path.join(__dirname, 'hardening', 'schema.sql'), 'utf8'));
+    await ensureCardNumberUnique();
     await initializeBaseData();
     await ensureAdminSecurityDefaults();
     await ensureHcaptchaConfigDefaults();
@@ -821,7 +791,7 @@ async function getBillingOverviewStats() {
 }
 
 async function getAdminData() {
-    const [configRows, phoneRows, cardRows, logRows, statsRows, cdkStatsRows, billingOverviewRows] = await Promise.all([
+    const [configRows, phoneRows, cardCountRows, logRows, statsRows, cdkStatsRows, billingOverviewRows] = await Promise.all([
         runQuery(
             `SELECT config_key, config_value
              FROM app_config
@@ -847,11 +817,7 @@ async function getAdminData() {
              FROM phone_assets
              ORDER BY sort_order ASC, id ASC`
         ),
-        runQuery(
-            `SELECT card_number, card_expiry, card_cvc, usage_count, is_active, status
-             FROM card_assets
-             ORDER BY sort_order ASC, id ASC`
-        ),
+        runQuery('SELECT COUNT(*) AS total FROM card_assets'),
         listAdminTaskLogs(200),
         runQuery(
             `SELECT
@@ -905,16 +871,9 @@ async function getAdminData() {
                     ? 'normal'
                     : String(row.status || 'invalid').trim() || 'invalid'
             })),
-            card_pool: cardRows.map((row) => ({
-                number: row.card_number,
-                expiry: row.card_expiry,
-                cvc: row.card_cvc,
-                usage_count: Number(row.usage_count || 0),
-                is_active: Number(row.is_active || 0),
-                status: Number(row.is_active || 0) === 1
-                    ? 'normal'
-                    : String(row.status || 'invalid').trim() || 'invalid'
-            }))
+            // 概览仅提供统计，不向普通后台会话返回卡号、有效期和 CVC。
+            card_pool: [],
+            card_pool_count: Number(cardCountRows[0]?.total || 0)
         },
         stats: {
             total: Number(stats.total || 0),
@@ -1054,6 +1013,8 @@ async function saveConfig(config = {}) {
         }
 
         if (cardPool !== null) {
+            const busyCards = await runQuery('SELECT id FROM card_assets WHERE in_use = 1 LIMIT 1 FOR UPDATE', [], { connection });
+            if (busyCards.length) throw new Error('卡池有正在使用的卡片，请等待任务结束后再保存');
             if (cardPool.length > 0) {
                 const cardNumbers = cardPool.map((item) => item[0]);
                 const cardPlaceholders = cardNumbers.map(() => '?').join(', ');
@@ -1063,25 +1024,13 @@ async function saveConfig(config = {}) {
                     cardNumbers,
                     { connection }
                 );
-                for (const card of cardPool) {
-                    const result = await runExecute(
-                        `UPDATE card_assets
-                         SET card_expiry = ?,
-                             card_cvc = ?,
-                             sort_order = ?,
-                             is_active = ?
-                         WHERE card_number = ?`,
-                        [card[1], card[2], card[3], card[4], card[0]],
-                        { connection }
+                for (let offset = 0; offset < cardPool.length; offset += 100) {
+                    await connection.query(
+                        `INSERT INTO card_assets (card_number, card_expiry, card_cvc, sort_order, is_active) VALUES ?
+                         ON DUPLICATE KEY UPDATE card_expiry = VALUES(card_expiry), card_cvc = VALUES(card_cvc),
+                         sort_order = VALUES(sort_order), is_active = VALUES(is_active)`,
+                        [cardPool.slice(offset, offset + 100)]
                     );
-                    if (result.affectedRows === 0) {
-                        await runExecute(
-                            `INSERT INTO card_assets (card_number, card_expiry, card_cvc, sort_order, is_active)
-                             VALUES (?, ?, ?, ?, ?)`,
-                            card,
-                            { connection }
-                        );
-                    }
                 }
             } else {
                 await runExecute(`DELETE FROM card_assets`, [], { connection });
@@ -1181,6 +1130,12 @@ async function listSessions(options = {}) {
             ? new Date(row.updated_at).toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-')
             : null
     }));
+}
+
+async function getSessionsByJobKeys(jobKeys) {
+    const keys = [...new Set(jobKeys.map(String))];
+    if (!keys.length) return [];
+    return runQuery('SELECT job_key, session_payload FROM task_logs WHERE job_key IN (?)', [keys]);
 }
 
 async function getSessionByJobKey(jobKey) {
@@ -1505,7 +1460,12 @@ async function releaseStaleAssetLocks() {
         runExecute(
             `UPDATE card_assets
              SET in_use = 0, locked_at = NULL, locked_by = NULL
-             WHERE in_use = 1 AND (locked_at IS NULL OR locked_at < ?)`,
+             WHERE in_use = 1 AND (locked_at IS NULL OR locked_at < ?)
+               AND NOT EXISTS (
+                   SELECT 1 FROM activation_claims a WHERE a.lease_until > NOW()
+                   AND (card_assets.locked_by = CONCAT('payment_', a.job_key)
+                     OR card_assets.locked_by = CONCAT('gptapi_', a.job_key))
+               )`,
             [staleThreshold]
         ),
         runExecute(
@@ -1596,27 +1556,24 @@ async function bulkImportPoolEmails(text) {
     let applied = 0;
     let oauthCount = 0;
 
-    await withTransaction(async (connection) => {
-        for (let i = 0; i < rows.length; i++) {
-            const { email, password, clientId, refreshToken } = rows[i];
-            if (refreshToken) {
-                oauthCount += 1;
-            }
-            await connection.execute(
-                `INSERT INTO pool_emails (email, password, client_id, refresh_token, sort_order, is_active)
-                 VALUES (?, ?, ?, ?, ?, 1)
-                 ON DUPLICATE KEY UPDATE
-                    password = VALUES(password),
-                    client_id = CASE WHEN VALUES(client_id) <> '' THEN VALUES(client_id) ELSE pool_emails.client_id END,
-                    refresh_token = CASE WHEN VALUES(refresh_token) IS NOT NULL AND VALUES(refresh_token) <> ''
-                                         THEN VALUES(refresh_token)
-                                         ELSE pool_emails.refresh_token END,
-                    is_active = 1`,
-                [email, password, clientId || '', refreshToken || null, i]
-            );
-            applied += 1;
-        }
+    const values = rows.map(({ email, password, clientId, refreshToken }, index) => {
+        if (refreshToken) oauthCount += 1;
+        return [email, password, clientId || '', refreshToken || null, index];
     });
+    // 先整理全部数据，再按批次写入，避免一封邮箱一次数据库往返。
+    for (let offset = 0; offset < values.length; offset += 100) {
+        const batch = values.slice(offset, offset + 100);
+        await withTransaction(async connection => {
+            await connection.query(
+                `INSERT INTO pool_emails (email, password, client_id, refresh_token, sort_order, is_active)
+                 VALUES ? ON DUPLICATE KEY UPDATE password = VALUES(password),
+                 client_id = IF(VALUES(client_id) <> '', VALUES(client_id), client_id),
+                 refresh_token = COALESCE(NULLIF(VALUES(refresh_token), ''), refresh_token), is_active = 1`,
+                [batch.map(row => [...row, 1])]
+            );
+        });
+        applied += batch.length;
+    }
 
     return { applied, parsed: rows.length, skipped, oauthCount };
 }
@@ -2365,13 +2322,11 @@ async function saveTelegramConfig(config = {}) {
 }
 
 async function getMaxConcurrentActivations() {
-    const config = await getAdminData();
-    return config.config.max_concurrent_activations;
+    return Math.max(1, Number(await getAppConfigValue('max_concurrent_activations', '1')) || 1);
 }
 
 async function getMaxBackgroundConcurrent() {
-    const config = await getAdminData();
-    return config.config.max_background_concurrent;
+    return Math.max(1, Number(await getAppConfigValue('max_background_concurrent', '1')) || 1);
 }
 
 async function getMaintenanceModeState() {
@@ -2668,6 +2623,7 @@ async function updateTaskLog(jobKey, { status, message, rawOutput, cdkCode, phon
     const screenshotsJson = Array.isArray(failureScreenshots)
         ? JSON.stringify(failureScreenshots)
         : null;
+    // 终态只能补充同一状态的数据；迟到的进度、失败回调不能反向覆盖成功结果。
     await runExecute(
         `UPDATE task_logs
          SET status = ?,
@@ -2682,7 +2638,8 @@ async function updateTaskLog(jobKey, { status, message, rawOutput, cdkCode, phon
              gpt_api_task_id = COALESCE(?, gpt_api_task_id),
              gpt_api_raw = COALESCE(?, gpt_api_raw),
              gpt_api_topup_code = COALESCE(?, gpt_api_topup_code)
-         WHERE job_key = ?`,
+          WHERE job_key = ?
+            AND (status = 'running' OR status = ?)`,
         [
             String(status),
             message || null,
@@ -2696,7 +2653,8 @@ async function updateTaskLog(jobKey, { status, message, rawOutput, cdkCode, phon
             gptApiTaskId || null,
             gptApiRaw || null,
             gptApiTopupCode || null,
-            String(jobKey)
+            String(jobKey),
+            String(status)
         ]
     );
 }
@@ -3024,8 +2982,9 @@ async function reserveCard(ownerKey) {
 /**
  * 释放卡片锁定。
  * @param {number} cardId - 卡片 ID
+ * @param {string} [ownerKey] - 任务释放时核对锁归属，防止迟到补偿释放新任务的锁。
  */
-async function releaseCard(cardId) {
+async function releaseCard(cardId, ownerKey) {
     if (!cardId) {
         return;
     }
@@ -3034,8 +2993,8 @@ async function releaseCard(cardId) {
          SET in_use = 0,
              locked_at = NULL,
              locked_by = NULL
-         WHERE id = ?`,
-        [Number(cardId)]
+         WHERE id = ? AND (? IS NULL OR locked_by = ?)`,
+        [Number(cardId), ownerKey || null, ownerKey || null]
     );
 }
 
@@ -3166,123 +3125,6 @@ async function bindCardPaymentProfile(cardId, profile = {}) {
     );
 }
 
-// ─── Card Import ─────────────────────────────────────────────────────────────
-
-const { validateCard } = require('./card-validator');
-
-/**
- * 批量导入信用卡（含格式验证 + 去重）。
- * - 单次上限 500 张，超出直接抛错
- * - 对每张卡执行 validateCard；验证不通过计入 failed
- * - 验证通过后检查数据库是否已存在相同 card_number，存在则计入 skipped
- * - 剩余的卡片插入数据库，计入 imported
- * - imported + skipped + failed 始终等于输入数组长度
- *
- * @param {Array<{ card_number: string, card_expiry: string, card_cvc: string, card_holder?: string }>} cards
- * @returns {Promise<{ imported: number, skipped: number, failed: number, failures: Array<{ index: number, errors: string[] }> }>}
- */
-async function importCards(cards) {
-    if (!Array.isArray(cards)) {
-        throw new Error('cards 参数必须为数组');
-    }
-
-    if (cards.length > 500) {
-        throw new Error('单次导入上限 500 条');
-    }
-
-    const failures = []; // { index, errors }
-    const validCards = [];  // { index, card_number, card_expiry, card_cvc, card_holder }
-
-    // Step 1: Validate each card
-    for (let i = 0; i < cards.length; i++) {
-        const card = cards[i];
-        const result = validateCard(card);
-        if (!result.valid) {
-            failures.push({ index: i, errors: result.errors });
-        } else {
-            validCards.push({
-                index: i,
-                card_number: String(card.card_number).trim(),
-                card_expiry: String(card.card_expiry).trim(),
-                card_cvc: String(card.card_cvc).trim(),
-                card_holder: String(card.card_holder || '').trim()
-            });
-        }
-    }
-
-    if (validCards.length === 0) {
-        return {
-            imported: 0,
-            skipped: 0,
-            failed: failures.length,
-            failures
-        };
-    }
-
-    // Step 2: Check for duplicates in database
-    const cardNumbers = validCards.map((c) => c.card_number);
-    const placeholders = cardNumbers.map(() => '?').join(', ');
-    const existingRows = await runQuery(
-        `SELECT card_number FROM card_assets WHERE card_number IN (${placeholders})`,
-        cardNumbers
-    );
-    const existingSet = new Set(existingRows.map((r) => r.card_number));
-
-    const toInsert = [];
-    let skipped = 0;
-
-    for (const card of validCards) {
-        if (existingSet.has(card.card_number)) {
-            skipped++;
-        } else {
-            toInsert.push(card);
-        }
-    }
-
-    // Step 3: Insert new cards (also deduplicate within the batch itself)
-    let imported = 0;
-    const seenInBatch = new Set();
-
-    for (const card of toInsert) {
-        if (seenInBatch.has(card.card_number)) {
-            skipped++;
-            continue;
-        }
-        seenInBatch.add(card.card_number);
-
-        try {
-            await runExecute(
-                `INSERT INTO card_assets (card_number, card_expiry, card_cvc, card_holder, sort_order, is_active, status)
-                 VALUES (?, ?, ?, ?, 0, 1, '正常')`,
-                [card.card_number, card.card_expiry, card.card_cvc, card.card_holder]
-            );
-            imported++;
-        } catch (err) {
-            // Duplicate key error (in case of race condition)
-            if (err.message && err.message.includes('Duplicate')) {
-                skipped++;
-            } else {
-                failures.push({ index: card.index, errors: [err.message || '插入失败'] });
-            }
-        }
-    }
-
-    return {
-        imported,
-        skipped,
-        failed: failures.length,
-        failures
-    };
-}
-
-// ─── Region Selector ────────────────────────────────────────────────────────
-
-const { SUPPORTED_REGIONS, DEFAULT_REGION } = require('./region-config');
-
-/**
- * 获取当前支付地区代码
- * @returns {Promise<string>} 地区代码（如 'PH'）
- */
 async function getPaymentRegion() {
     const value = await getAppConfigValue('payment_region', DEFAULT_REGION);
     // 如果数据库中的值无效，返回默认值
@@ -3617,7 +3459,6 @@ module.exports = {
     markCardExhausted,
     recordCardUsage,
     bindCardPaymentProfile,
-    importCards,
     getPaymentRegion,
     setPaymentRegion,
     createBillingRecord,
@@ -3627,6 +3468,7 @@ module.exports = {
     deleteBillingRecord,
     deleteFailedBillingRecords,
     getSessionByJobKey,
+    getSessionsByJobKeys,
     PLAN_NAME_MAP,
     resolvePlanName,
     connectionInfo: {

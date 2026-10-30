@@ -1,4 +1,5 @@
 node_modules
+.local
 .git
 .env
 .env.*
@@ -6,6 +7,8 @@ node_modules
 debug_screenshots
 product_files
 data/browser-pool
+data/task-access.secret
+data/payment-outbox
 *.sql.gz
 .DS_Store
 .vscode
